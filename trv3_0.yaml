@@ -1,0 +1,282 @@
+
+blueprint:
+  name: TRV Calibrator V3
+  description: >
+    Ereignisbasierte Kalibrierung von Heizkörperthermostaten
+    anhand externer Temperatursensoren.
+    Mit einstellbarer Toleranz, Sperrzeit, Sicherheitsprüfung,
+    Kalibrierungsbegrenzung und automatischer Nachkontrolle.
+  domain: automation
+
+  input:
+    trv:
+      name: Heizkörperthermostat
+      selector:
+        entity:
+          domain: climate
+
+    temperature_sensor:
+      name: Externer Temperatursensor
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+
+    trv_calibration_number:
+      name: Temperaturkalibrierung des TRV
+      description: >
+        Kalibrierungsentität des Heizkörperthermostats.
+        Nicht die Kalibrierung des externen Fühlers!
+      selector:
+        entity:
+          domain: number
+
+    delay_in_minutes:
+      name: Sperrzeit nach Kalibrierung
+      description: >
+        Wartezeit nach einer erfolgten Korrektur.
+        Anschließend werden die Temperaturen erneut geprüft.
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: min
+
+    temperature_tolerance:
+      name: Korrekturtoleranz
+      description: >
+        Mindestabweichung zwischen Raumfühler und
+        Thermostat, ab der korrigiert wird.
+      default: 0.3
+      selector:
+        number:
+          min: 0.1
+          max: 2
+          step: 0.1
+          unit_of_measurement: "°C"
+
+    maximum_offset:
+      name: Maximale Kalibrierung
+      description: >
+        Begrenzt den absoluten Kalibrierungswert.
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+
+    maximum_correction:
+      name: Maximale Korrektur pro Durchlauf
+      description: >
+        Begrenzt die Änderung des Kalibrierungswertes
+        innerhalb eines einzelnen Durchlaufs.
+      default: 3
+      selector:
+        number:
+          min: 0.5
+          max: 10
+          step: 0.5
+          unit_of_measurement: "°C"
+
+mode: single
+max_exceeded: silent
+
+variables:
+  trv: !input trv
+  temperature_sensor: !input temperature_sensor
+  calibration_entity: !input trv_calibration_number
+  tolerance: !input temperature_tolerance
+  max_offset_limit: !input maximum_offset
+  max_correction: !input maximum_correction
+
+trigger:
+
+  # Externer Temperaturfühler meldet neuen Wert
+  - platform: state
+    entity_id: !input temperature_sensor
+    to: null
+
+  # Interne Temperatur des Thermostats ändert sich
+  - platform: state
+    entity_id: !input trv
+    attribute: current_temperature
+
+  # Sicherheitsprüfung alle 15 Minuten
+  - platform: time_pattern
+    minutes: "/15"
+
+  # Prüfung nach Home-Assistant-Neustart
+  - platform: homeassistant
+    event: start
+
+action:
+
+  # Verhindert die Kalibrierung eines fremden Gerätes
+  - condition: template
+    value_template: >
+      {{
+        device_id(trv) is not none
+        and device_id(trv) == device_id(calibration_entity)
+      }}
+
+  # Maximal fünf Korrekturdurchläufe pro Auslösung
+  - repeat:
+      count: 5
+      sequence:
+
+        # Verfügbarkeit der Geräte prüfen
+        - if:
+            - condition: template
+              value_template: >
+                {{
+                  states(trv) in ['unknown', 'unavailable']
+                  or not is_number(states(temperature_sensor))
+                  or not is_number(state_attr(trv, 'current_temperature'))
+                  or not is_number(states(calibration_entity))
+                }}
+          then:
+            - stop: "Temperaturwerte nicht verfügbar"
+
+        # Aktuelle Werte auslesen
+        - variables:
+            room_temp: >
+              {{ states(temperature_sensor) | float }}
+
+            trv_temp: >
+              {{ state_attr(trv, 'current_temperature') | float }}
+
+            current_offset: >
+              {{ states(calibration_entity) | float }}
+
+            min_offset: >
+              {{ [
+                state_attr(calibration_entity, 'min') | float(-30),
+                -max_offset_limit
+              ] | max }}
+
+            max_offset: >
+              {{ [
+                state_attr(calibration_entity, 'max') | float(30),
+                max_offset_limit
+              ] | min }}
+
+            offset_step: >
+              {{ state_attr(calibration_entity, 'step') | float(1) }}
+
+            step_origin: >
+              {{ state_attr(calibration_entity, 'min') | float(-30) }}
+
+        # Plausibilitätsprüfung
+        - if:
+            - condition: template
+              value_template: >
+                {{
+                  not (0 < room_temp < 45)
+                  or not (-10 < trv_temp < 60)
+                  or offset_step <= 0
+                  or min_offset > max_offset
+                }}
+          then:
+            - stop: "Ungültige Temperatur- oder Kalibrierungswerte"
+
+        # Temperaturabweichung bestimmen
+        - variables:
+            temperature_difference: >
+              {{ room_temp - trv_temp }}
+
+        # Prüfen, ob eine Korrektur erforderlich ist
+        - if:
+            - condition: template
+              value_template: >
+                {{
+                  (temperature_difference | abs | round(4))
+                  < tolerance
+                }}
+          then:
+            - stop: "Temperatur innerhalb der Toleranz"
+
+        # Kalibrierungswert berechnen
+        - variables:
+            new_offset: >
+              {% set correction = [
+                [temperature_difference, -max_correction] | max,
+                max_correction
+              ] | min %}
+
+              {% set raw = current_offset + correction %}
+
+              {% set lower = [
+                min_offset,
+                current_offset - max_correction
+              ] | max %}
+
+              {% set upper = [
+                max_offset,
+                current_offset + max_correction
+              ] | min %}
+
+              {% set low_step = (
+                (lower - step_origin) / offset_step
+              ) | round(0, 'ceil') %}
+
+              {% set high_step = (
+                (upper - step_origin) / offset_step
+              ) | round(0, 'floor') %}
+
+              {% set desired_step = (
+                (raw - step_origin) / offset_step
+              ) | round(0) %}
+
+              {% if low_step <= high_step %}
+                {% set bounded_step = [
+                  [desired_step, low_step] | max,
+                  high_step
+                ] | min %}
+                {{ (step_origin + bounded_step * offset_step) | round(4) }}
+              {% else %}
+                {{ current_offset }}
+              {% endif %}
+
+        # Unnötige Schreibbefehle verhindern
+        - if:
+            - condition: template
+              value_template: >
+                {{
+                  ((new_offset - current_offset) | abs)
+                  < (offset_step - 0.0001)
+                }}
+          then:
+            - stop: "Keine weitere Korrektur erforderlich oder möglich"
+
+        # Thermostat kalibrieren
+        - service: number.set_value
+          target:
+            entity_id: !input trv_calibration_number
+          data:
+            value: "{{ new_offset }}"
+
+        # Sperrzeit nach erfolgter Kalibrierung
+        - delay:
+            minutes: !input delay_in_minutes
+
+        # Prüfen, ob das Thermostat die Korrektur
+        # übernommen und eine neue Temperatur gemeldet hat
+        - if:
+            - condition: template
+              value_template: >
+                {{
+                  not is_number(states(calibration_entity))
+                  or not is_number(state_attr(trv, 'current_temperature'))
+                  or (
+                    (states(calibration_entity) | float(0) - new_offset)
+                    | abs
+                  ) > 0.001
+                  or state_attr(trv, 'current_temperature') | float(0)
+                    == trv_temp
+                }}
+          then:
+            - stop: "Kalibrierung oder Temperaturänderung noch nicht bestätigt"
