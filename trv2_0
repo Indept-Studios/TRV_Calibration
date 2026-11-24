@@ -1,0 +1,136 @@
+
+blueprint:
+  name: TRV Calibrator V2
+  description: >
+    Dynamische Kalibrierung von Heizkörperthermostaten
+    anhand externer Temperatursensoren.
+    Mit Hysterese, Werteprüfung und Mindestwartezeit.
+  domain: automation
+
+  input:
+    trv:
+      name: Heizkörperthermostat
+      selector:
+        entity:
+          domain: climate
+
+    temperature_sensor:
+      name: Externer Temperatursensor
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+
+    trv_calibration_number:
+      name: Temperaturkalibrierung des TRV
+      selector:
+        entity:
+          domain: number
+
+    delay_in_minutes:
+      name: Mindestwartezeit nach Kalibrierung
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: min
+
+    temperature_tolerance:
+      name: Temperaturtoleranz
+      description: >
+        Temperaturabweichung, ab der eine
+        Kalibrierung vorgenommen wird.
+      default: 0.3
+      selector:
+        number:
+          min: 0.1
+          max: 2
+          step: 0.1
+          unit_of_measurement: "°C"
+
+mode: single
+max_exceeded: silent
+
+variables:
+  trv: !input trv
+  temperature_sensor: !input temperature_sensor
+  calibration_entity: !input trv_calibration_number
+  tolerance: !input temperature_tolerance
+
+trigger:
+  - platform: time_pattern
+    minutes: "/5"
+
+  - platform: homeassistant
+    event: start
+
+condition:
+  - condition: template
+    value_template: >
+      {{
+        states(trv) not in ['unknown', 'unavailable']
+        and is_number(states(temperature_sensor))
+        and is_number(state_attr(trv, 'current_temperature'))
+        and is_number(states(calibration_entity))
+      }}
+
+action:
+  - variables:
+      room_temp: >
+        {{ states(temperature_sensor) | float }}
+
+      trv_temp: >
+        {{ state_attr(trv, 'current_temperature') | float }}
+
+      current_offset: >
+        {{ states(calibration_entity) | float }}
+
+      min_offset: >
+        {{ state_attr(calibration_entity, 'min') | float(-5) }}
+
+      max_offset: >
+        {{ state_attr(calibration_entity, 'max') | float(5) }}
+
+      offset_step: >
+        {{ state_attr(calibration_entity, 'step') | float(1) }}
+
+  - condition: template
+    value_template: >
+      {{
+        0 < room_temp < 45
+        and -10 < trv_temp < 60
+        and offset_step > 0
+        and min_offset <= max_offset
+      }}
+
+  - variables:
+      temperature_difference: >
+        {{ room_temp - trv_temp }}
+
+      new_offset: >
+        {% set raw = current_offset + room_temp - trv_temp %}
+        {% set rounded = min_offset +
+          (((raw - min_offset) / offset_step) | round(0))
+          * offset_step %}
+        {{ [[rounded, min_offset] | max,
+          max_offset] | min | round(4) }}
+
+  - condition: template
+    value_template: >
+      {{
+        (temperature_difference | abs) >= tolerance
+        and
+        ((new_offset - current_offset) | abs)
+        >= (offset_step - 0.0001)
+      }}
+
+  - service: number.set_value
+    target:
+      entity_id: !input trv_calibration_number
+    data:
+      value: "{{ new_offset }}"
+
+  - delay:
+      minutes: !input delay_in_minutes
